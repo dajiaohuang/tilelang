@@ -2,6 +2,7 @@
 
 import re
 
+import pytest
 import tilelang
 import tilelang.language as T
 import tilelang.testing
@@ -612,6 +613,38 @@ def test_tiled_ws_declines_pipeline_loop_inside_while():
     assert "tl_tiled_ws_applied" not in script
     assert "kWarpSpecializationScope" not in script
     assert "num_stages" in script
+
+    # The declined loop must still reach ordinary software-pipeline lowering.
+    mod = tilelang.transform.PipelinePlanning()(mod)
+    assert "software_pipeline_stage" in mod["main"].script()
+    mod = tilelang.transform.InjectSoftwarePipeline()(mod)
+    script = mod["main"].script()
+    assert "while" in script
+    assert "tl.tileop.copy" in script
+    assert "tl_tiled_ws_applied" not in script
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize(
+    "kernel_factory,num_stages,disable_ws,expect_warning",
+    [
+        (matmul_while_pipelined, 2, False, True),
+        (matmul_while_pipelined, 0, False, False),
+        (matmul_while_pipelined, 2, True, False),
+        (matmul_pipelined, 2, False, False),
+    ],
+)
+def test_tiled_ws_while_warning(capfd, kernel_factory, num_stages, disable_ws, expect_warning):
+    """Warn only when an otherwise eligible pipeline is excluded by while."""
+    func = kernel_factory(64, 64, 64, 64, 32, 64, num_stages=num_stages).with_attr("global_symbol", "main")
+    mod = tvm.IRModule.from_expr(func)
+    target = determine_target({"kind": "cuda", "arch": "sm_90"}, return_object=True)
+    mod = tvm.tirx.transform.BindTarget(target)(mod)
+    mod = tilelang.transform.MaterializeKernelLaunch()(mod)
+    with tvm.transform.PassContext(config={"tl.disable_warp_specialized": disable_ws}):
+        tilelang.cuda.transform.ProducerConsumerWarpSpecialized()(mod)
+    message = "Automatic warp specialization is not supported for pipelined loops inside a while loop"
+    assert capfd.readouterr().err.count(message) == int(expect_warning)
 
 
 @tilelang.testing.requires_cuda

@@ -2488,8 +2488,19 @@ private:
     in_pipeline_ = old;
   }
 
-  // Match PipelineLoopFinder: a while-contained loop is not a WS candidate.
-  void VisitStmt_(const WhileNode *) final {}
+  void VisitStmt_(const WhileNode *op) final {
+    // Inspect only for the diagnostic; do not admit while-contained pipelines
+    // as WS candidates or expand their buffers before non-WS lowering.
+    TiledWSCandidate nested;
+    nested.target_ = target_;
+    nested.layout_map_ = layout_map_;
+    nested(op->body);
+    if (nested.has_pipeline_loop_ && nested.has_tma_tile_op_) {
+      LOG(WARNING) << "Automatic warp specialization is not supported for "
+                      "pipelined loops inside a while loop; retaining pipeline "
+                      "annotations for non-WS lowering.";
+    }
+  }
 
   void VisitExpr_(const CallNode *op) final {
     if (in_pipeline_ && !has_tma_tile_op_) {
