@@ -80,6 +80,30 @@ def test_auto_target_uses_registered_detector_order_for_rocm():
         target_registry._TARGET_DETECTORS.update(old_detectors)
 
 
+@pytest.mark.parametrize("current_device, expected_arch, expected_warp_size", [(0, "gfx942", 64), (1, "gfx1151", 32)])
+def test_auto_rocm_target_follows_current_device(monkeypatch, current_device, expected_arch, expected_warp_size):
+    from types import SimpleNamespace
+
+    import torch
+    import tilelang.backend.target as target_registry
+    import tilelang.rocm.target as rocm_target
+
+    devices = [SimpleNamespace(gcnArchName="gfx942"), SimpleNamespace(gcnArchName="gfx1151:xnack-")]
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current_device)
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda index: devices[index])
+    monkeypatch.setattr(rocm_target, "check_hip_availability", lambda: True)
+    monkeypatch.setattr(target_registry, "_TARGET_DETECTORS", {})
+    target_registry.register_target_detector("hip", rocm_target._detect_rocm_target)
+
+    target = determine_target("auto", return_object=True)
+    assert target_get_mcpu(target) == expected_arch
+    assert int(target.attrs["thread_warp_size"]) == expected_warp_size
+    explicit = determine_target({"kind": "hip", "mcpu": "gfx942"}, return_object=True)
+    assert target_get_mcpu(explicit) == "gfx942"
+    assert int(explicit.attrs["thread_warp_size"]) == 64
+
+
 def test_rdna_gfx1151_target_classification():
     target = _hip_target("gfx1151")
     assert target_is_rdna(target)
