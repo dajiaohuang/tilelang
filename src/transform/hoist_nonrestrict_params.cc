@@ -8,6 +8,7 @@
  * placement within the function body flexible for frontends.
  */
 #include "support/check.h"
+#include <unordered_set>
 #include <tvm/ir/cast.h>
 #include <tvm/ir/transform.h>
 #include <tvm/tirx/function.h>
@@ -37,17 +38,9 @@ public:
 
 private:
   void MaybeInsert(const Var &v) {
-    if (!v.defined())
+    if (seen_vars_.count(v))
       return;
-    const VarNode *p = v.get();
-    if (seen_ptr_.count(p))
-      return;
-    // Exact-name dedup handles recreated Vars without conflating a user
-    // buffer named "A_handle" with a distinct buffer named "A".
-    if (seen_name_.count(v->name_hint))
-      return;
-    seen_ptr_.insert(p);
-    seen_name_.insert(v->name_hint);
+    seen_vars_.insert(v);
     collected_.push_back(v);
   }
 
@@ -67,8 +60,7 @@ private:
   }
 
   std::vector<Var> collected_;
-  std::unordered_set<const VarNode *> seen_ptr_;
-  std::unordered_set<std::string> seen_name_;
+  std::unordered_set<Var, ObjectPtrHash, ObjectPtrEqual> seen_vars_;
 };
 
 static PrimFunc HoistNonRestrictParams(PrimFunc f) {
@@ -82,13 +74,10 @@ static PrimFunc HoistNonRestrictParams(PrimFunc f) {
   // Merge with any existing PrimFunc-level attribute if present
   if (auto opt_existing = f->GetAttr<Array<Var>>(attr::kNonRestrictParams)) {
     for (const Var &v : opt_existing.value()) {
-      // Reuse the collector's dedup logic by temporarily constructing a new
-      // collector Alternatively, do a small inline dedup mirroring MaybeInsert
-      // Here we inline a simplified pointer-based dedup plus name-based
-      // fallback
+      // Attributes and codegen consumers identify buffers by Var identity.
       bool exists = false;
       for (const Var &cur : from_blocks) {
-        if (cur.get() == v.get() || cur->name_hint == v->name_hint) {
+        if (cur.same_as(v)) {
           exists = true;
           break;
         }

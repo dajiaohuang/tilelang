@@ -59,5 +59,38 @@ def test_cuda_restrict_annotation_keeps_handle_suffix_buffers():
     assert "__restrict__" not in sig
 
 
+def test_nonrestrict_hoist_preserves_same_hint_var_identity():
+    tirx = tilelang.tvm.tirx
+    a = tirx.Var("A", "handle")
+    b = tirx.Var("A", "handle")
+    block = tirx.SBlock(
+        [],
+        [],
+        [],
+        "root",
+        tirx.Evaluate(0),
+        annotations={"tl.non_restrict_params": [a, b, a]},
+    )
+    func = tirx.PrimFunc([a, b], tirx.SBlockRealize([], True, block))
+    func = func.with_attr("tl.non_restrict_params", [b, a])
+    mod = tilelang.transform.HoistNonRestrictParams()(tilelang.tvm.IRModule({"main": func}))
+    variables = mod["main"].attrs["tl.non_restrict_params"]
+    assert len(variables) == 2
+    assert variables[0].same_as(a)
+    assert variables[1].same_as(b)
+
+
+def test_nonrestrict_function_attribute_preserves_same_hint_var_identity():
+    tirx = tilelang.tvm.tirx
+    a = tirx.Var("A", "handle")
+    b = tirx.Var("A", "handle")
+    func = tirx.PrimFunc([a, b], tirx.Evaluate(0)).with_attr("tl.non_restrict_params", [a, b, a])
+    mod = tilelang.transform.HoistNonRestrictParams()(tilelang.tvm.IRModule({"main": func}))
+    variables = mod["main"].attrs["tl.non_restrict_params"]
+    assert len(variables) == 2
+    assert variables[0].same_as(a)
+    assert variables[1].same_as(b)
+
+
 if __name__ == "__main__":
     tilelang.testing.main()
