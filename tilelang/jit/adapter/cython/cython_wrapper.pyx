@@ -12,7 +12,8 @@ cdef class CythonKernelWrapper:
     # Class attributes to store kernel configuration and library reference
     cdef:
         object dynamic_symbolic_map    # Maps dynamic dimensions to their corresponding tensor indices
-        object dynamic_symbolic_sources  # Maps dynamic var names to ALL buffer carriers for cascaded None resolution
+        object dynamic_symbolic_sources  # Maps dynamic Vars to ALL buffer carriers for cascaded None resolution
+        object scalar_param_map        # Maps explicit scalar Vars to primary argument indices
         object buffer_device_map       # Maps buffer variables to their corresponding devices
         object buffer_dtype_map        # Maps buffer variables to their corresponding dtypes
         object static_shape_map        # Maps buffer variables to their corresponding static shapes
@@ -50,6 +51,20 @@ cdef class CythonKernelWrapper:
                 else:
                     native_shape.append(dim)
             self.param_shapes.append(native_shape)
+
+    def set_output_shapes(self, prim_func, result_idx):
+        # Cached KernelParams are deserialized separately from the PrimFunc.
+        # Bind output dimensions and runtime sources in the same Var identity domain.
+        for i in result_idx:
+            self.param_shapes[i] = [
+                int(dim) if isinstance(dim, tirx.IntImm) else dim
+                for dim in prim_func.buffer_map[prim_func.params[i]].shape
+            ]
+        return self
+
+    def set_scalar_param_map(self, scalar_param_map):
+        self.scalar_param_map = scalar_param_map
+        return self
 
     def set_dynamic_symbolic_map(self, dynamic_symbolic_map):
         self.dynamic_symbolic_map = dynamic_symbolic_map
@@ -214,13 +229,14 @@ cdef class CythonKernelWrapper:
                 # Now working with native Python list, no FFI calls needed
                 for s in self.param_shapes[i]:
                     if isinstance(s, tirx.Var):
-                        for key in self.dynamic_symbolic_map:
-                            if str(s) == str(key):
-                                ref_id, ref_tensor_idx, ref_shape_idx, stride_scale = self.dynamic_symbolic_map[key]
-                                if ref_id == 0:
-                                    shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx])
-                                else:
-                                    shape.append(tensor_list[ref_tensor_idx].stride(ref_shape_idx) * stride_scale)
+                        if s in self.scalar_param_map:
+                            shape.append(tensor_list[self.scalar_param_map[s]])
+                        else:
+                            ref_id, ref_tensor_idx, ref_shape_idx, stride_scale = self.dynamic_symbolic_map[s]
+                            if ref_id == 0:
+                                shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx])
+                            else:
+                                shape.append(tensor_list[ref_tensor_idx].stride(ref_shape_idx) * stride_scale)
                     else:  # Already converted to Python int during initialization
                         shape.append(s)
 
@@ -285,8 +301,7 @@ cdef class CythonKernelWrapper:
         # Add dynamic dimension values to kernel arguments
         for var, (ref_id, buffer_idx, shape_idx, stride_scale) in self.dynamic_symbolic_map.items():
             # Cascaded resolution across all carrier buffers to handle None
-            var_key = str(var)
-            sources = self.dynamic_symbolic_sources.get(var_key, [(ref_id, buffer_idx, shape_idx, stride_scale)])
+            sources = self.dynamic_symbolic_sources[var]
             value = 0
             for src_ref_id, src_buf_idx, src_dim_idx, src_stride_scale in sources:
                 tensor = tensor_list[src_buf_idx]

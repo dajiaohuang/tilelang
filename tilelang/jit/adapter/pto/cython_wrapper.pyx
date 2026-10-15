@@ -10,7 +10,8 @@ cdef class PTOKernelWrapper:
     # Class attributes to store kernel configuration and library reference
     cdef:
         object dynamic_symbolic_map    # Maps dynamic dimensions to their corresponding tensor indices
-        object dynamic_symbolic_sources  # Maps dynamic var names to ALL buffer carriers for cascaded None resolution
+        object dynamic_symbolic_sources  # Maps dynamic Vars to ALL buffer carriers for cascaded None resolution
+        object scalar_param_map        # Maps explicit scalar Vars to primary argument indices
         object buffer_device_map       # Maps buffer variables to their corresponding devices
         object buffer_dtype_map        # Maps buffer variables to their corresponding dtypes
         object param_storage_metadata  # Per-parameter (packed_dim, pack_factor) metadata
@@ -55,6 +56,16 @@ cdef class PTOKernelWrapper:
                     native_shape.append(dim)
             self.param_shapes.append(native_shape)
 
+    def set_output_shapes(self, prim_func, result_idx):
+        # Cached KernelParams are deserialized separately from the PrimFunc.
+        # Bind output dimensions and runtime sources in the same Var identity domain.
+        for i in result_idx:
+            self.param_shapes[i] = [
+                int(dim) if isinstance(dim, tirx.IntImm) else dim
+                for dim in prim_func.buffer_map[prim_func.params[i]].shape
+            ]
+        return self
+
     def set_dynamic_symbolic_map(self, dynamic_symbolic_map):
         self.dynamic_symbolic_map = dynamic_symbolic_map
         return self
@@ -85,6 +96,7 @@ cdef class PTOKernelWrapper:
 
     def set_scalar_param_vars(self, scalar_param_vars):
         self.scalar_param_vars = scalar_param_vars
+        self.scalar_param_map = {var: i for i, var in enumerate(scalar_param_vars) if var is not None}
         return self
 
     def set_static_contiguous_list(self, static_contiguous_list):
@@ -164,8 +176,7 @@ cdef class PTOKernelWrapper:
         values = {}
         for var, (ref_id, buffer_idx, shape_idx, storage_scale) in self.dynamic_symbolic_map.items():
             # Cascaded resolution across all carrier buffers to handle None
-            var_key = str(var)
-            sources = self.dynamic_symbolic_sources.get(var_key, [(buffer_idx, shape_idx, storage_scale)])
+            sources = self.dynamic_symbolic_sources[var]
             value = 0
             for src_buf_idx, src_dim_idx, src_storage_scale in sources:
                 tensor = tensor_list[src_buf_idx]
@@ -322,13 +333,14 @@ cdef class PTOKernelWrapper:
                 # Now working with native Python list, no FFI calls needed
                 for s in self.param_shapes[i]:
                     if isinstance(s, tirx.Var):
-                        for key in self.dynamic_symbolic_map:
-                            if str(s) == str(key):
-                                ref_id, ref_tensor_idx, ref_shape_idx, storage_scale = self.dynamic_symbolic_map[key]
-                                if ref_id == 0:
-                                    shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx] * storage_scale)
-                                else:
-                                    shape.append(tensor_list[ref_tensor_idx].stride(ref_shape_idx) * storage_scale)
+                        if s in self.scalar_param_map:
+                            shape.append(tensor_list[self.scalar_param_map[s]])
+                        else:
+                            ref_id, ref_tensor_idx, ref_shape_idx, storage_scale = self.dynamic_symbolic_map[s]
+                            if ref_id == 0:
+                                shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx] * storage_scale)
+                            else:
+                                shape.append(tensor_list[ref_tensor_idx].stride(ref_shape_idx) * storage_scale)
                     else:  # Already converted to Python int during initialization
                         shape.append(s)
 

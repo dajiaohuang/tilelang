@@ -168,6 +168,7 @@ class PTOKernelAdapter(BaseKernelAdapter):
             raise RuntimeError(f"Initialization failed: {error_msg}")
 
         self.runtime_wrapper = PTOKernelWrapper(self.result_idx, self.params, self.lib, *_device_providers())
+        self.runtime_wrapper.set_output_shapes(self.prim_func, self.result_idx)
         self.runtime_wrapper.set_dynamic_symbolic_map(self.dynamic_symbolic_map)
         self.runtime_wrapper.set_dynamic_symbolic_sources(self.dynamic_symbolic_sources)
         self.runtime_wrapper.set_buffer_dtype_map(self.buffer_dtype_map)
@@ -221,7 +222,7 @@ class PTOKernelAdapter(BaseKernelAdapter):
                         dynamic_symbolic_map[stride] = (1, i, j, stride_scale)
         return dynamic_symbolic_map
 
-    def _process_dynamic_symbolic_sources(self) -> dict[str, list[tuple[int, int, int]]]:
+    def _process_dynamic_symbolic_sources(self) -> dict[tirx.Var, list[tuple[int, int, int]]]:
         """Build a multi-source map for cascaded None resolution.
 
         For each dynamic symbol, maps to ALL buffers that carry it as (buffer_idx, dim_idx, storage_scale).
@@ -234,20 +235,20 @@ class PTOKernelAdapter(BaseKernelAdapter):
         func = self.prim_func
         params = func.params
         buffer_map = func.buffer_map
-        sources: dict[str, list[tuple[int, int, int]]] = {}
+        sources: dict[tirx.Var, list[tuple[int, int, int]]] = {}
         for i, param in enumerate(params):
             if param in buffer_map:
                 buffer = buffer_map[param]
                 stride_scale = _storage_pack_factor(buffer.dtype)
                 for j, dim in enumerate(buffer.shape):
                     if isinstance(dim, tirx.Var) and dim not in params:
-                        key = str(dim)
+                        key = dim
                         if key not in sources:
                             sources[key] = []
                         sources[key].append((i, j, shape_scale(buffer, j)))
                 for j, stride in enumerate(buffer.strides):
                     if isinstance(stride, tirx.Var) and stride not in params:
-                        key = str(stride)
+                        key = stride
                         if key not in sources:
                             sources[key] = []
                         sources[key].append((i, j, stride_scale))
