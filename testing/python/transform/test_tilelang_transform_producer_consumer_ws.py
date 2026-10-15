@@ -598,6 +598,7 @@ def test_tiled_ws_stage3():
     torch.testing.assert_close(C.float(), ref, rtol=1e-2, atol=1e-2)
 
 
+@tilelang.testing.requires_cuda
 def test_tiled_ws_declines_pipeline_loop_inside_while():
     """WS discovery must skip while-wrapped pipelines instead of hitting an ICHECK."""
     func = matmul_while_pipelined(64, 64, 64, 64, 32, 64, num_stages=2).with_attr("global_symbol", "main")
@@ -610,6 +611,7 @@ def test_tiled_ws_declines_pipeline_loop_inside_while():
 
     assert "tl_tiled_ws_applied" not in script
     assert "kWarpSpecializationScope" not in script
+    assert "num_stages" in script
 
 
 @tilelang.testing.requires_cuda

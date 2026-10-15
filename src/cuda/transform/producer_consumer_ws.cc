@@ -2488,6 +2488,9 @@ private:
     in_pipeline_ = old;
   }
 
+  // Match PipelineLoopFinder: a while-contained loop is not a WS candidate.
+  void VisitStmt_(const WhileNode *) final {}
+
   void VisitExpr_(const CallNode *op) final {
     if (in_pipeline_ && !has_tma_tile_op_) {
       auto tile_op = ParseOperator(GetRef<Call>(op));
