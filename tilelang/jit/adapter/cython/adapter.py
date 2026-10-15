@@ -14,7 +14,7 @@ from tvm import tirx
 from tvm.relax import TensorType
 
 from tilelang.jit.adapter.base import BaseKernelAdapter, CachedTextSource
-from tilelang.jit.adapter.wrapper import TLWrapper
+from tilelang.jit.adapter.wrapper import TLWrapper, _get_dynamic_symbolic_vars
 from tilelang.jit.adapter.libgen import LibraryGenerator
 from tilelang.jit.adapter.utils import is_ascend_target, is_cpu_target, is_cuda_target, is_hip_target, is_metal_target
 from tilelang.backend.target import determine_target
@@ -280,7 +280,8 @@ class CythonKernelAdapter(BaseKernelAdapter):
                 for j, stride in enumerate(buffer.strides):
                     if isinstance(stride, tirx.Var) and (stride not in dynamic_symbolic_map) and (stride not in params):
                         dynamic_symbolic_map[stride] = (1, i, j, stride_scale)
-        return dynamic_symbolic_map
+        # Carrier preference is input-first; ABI slots remain in primary-function order.
+        return {var: dynamic_symbolic_map[var] for var in _get_dynamic_symbolic_vars(func)}
 
     def _process_scalar_param_map(self) -> dict[tirx.Var, int]:
         """Bind explicit scalar arguments without adding implicit launch arguments."""

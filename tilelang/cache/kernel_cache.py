@@ -278,6 +278,14 @@ class KernelCache:
             "compile_flags": compile_flags,
             **self._get_base_key(),
         }
+        if execution_backend in ("cython", "pto"):
+            from tilelang.jit.adapter.wrapper import _get_dynamic_symbolic_vars, _get_host_var_names
+
+            names = _get_host_var_names(func)
+            if any(names[var] != var.name for var in _get_dynamic_symbolic_vars(func)):
+                # Old wrappers collapsed these distinct Vars into one host slot.
+                # Do not reload a cached launcher with that incompatible signature.
+                key_data["host_symbol_binding"] = 1
         # Sort keys to ensure consistency
         key_string = json.dumps(key_data, sort_keys=True)
         # Use SHA256 to generate hash key

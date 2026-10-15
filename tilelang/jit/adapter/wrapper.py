@@ -15,7 +15,6 @@ from .utils import (
     is_hip_target,
     is_cpu_target,
     pythonic_expr,
-    parse_function_call_args,
     parse_tma_descriptor_args,
 )
 import re
@@ -219,6 +218,43 @@ def _require_lowered_modules(
     return device_mod, host_mod
 
 
+def _get_dynamic_symbolic_vars(prim_func) -> list[tvm.tirx.Var]:
+    """Implicit ABI order: parameter shapes first, then parameter strides."""
+    symbols = {}
+    for field in ("shape", "strides"):
+        for param in prim_func.params:
+            if param in prim_func.buffer_map:
+                for symbol in getattr(prim_func.buffer_map[param], field):
+                    if isinstance(symbol, tvm.tirx.Var) and symbol not in prim_func.params:
+                        symbols[symbol] = None
+    return list(symbols)
+
+
+def _get_host_var_names(prim_func) -> dict[tvm.tirx.Var, str]:
+    names = {}
+    for param in prim_func.params:
+        if param in prim_func.buffer_map:
+            data = prim_func.buffer_map[param].data
+            names[param] = names[data] = data.name
+        else:
+            names[param] = param.name
+    symbols = _get_dynamic_symbolic_vars(prim_func)
+    # Reserve unambiguous original hints before assigning collision suffixes.
+    reserved = set(names.values()) | {symbol.name for symbol in symbols} | {"stream"}
+    used = set(names.values()) | {"stream"}
+    for symbol in symbols:
+        name = symbol.name
+        if name in used:
+            suffix = 1
+            while f"{name}_{suffix}" in reserved:
+                suffix += 1
+            name = f"{name}_{suffix}"
+        names[symbol] = name
+        used.add(name)
+        reserved.add(name)
+    return names
+
+
 class TLCUDASourceWrapper:
     _TYPE_MAP = {
         "float32": "float",
@@ -267,6 +303,7 @@ class TLCUDASourceWrapper:
         self.tma_descriptor_args: dict | None = None
         self.l2_persistent_map: dict[str, dict] | None = {}
         self.pdl_sync_map: dict[str, int] | None = {}
+        self.host_var_names = _get_host_var_names(self.prim_func)
         self.parse_source_information()
         self.srcpath: str | None = None
         self.libpath: str | None = None
@@ -275,13 +312,34 @@ class TLCUDASourceWrapper:
     def _pythonic_expr(self, expr: tvm.tirx.PrimExpr) -> str:
         # This wrapper generates C/CUDA source. C/C++ integer division uses '/',
         # and '//' is not a valid operator in C/C++.
-        return pythonic_expr(expr, self._TYPE_MAP, floor_div_op="/")
+        return pythonic_expr(expr, self._TYPE_MAP, floor_div_op="/", var_name_map=self.host_var_names)
 
     def _lookup_type(self, dtype: str | Any) -> str:
         key = dtype if isinstance(dtype, str) else str(dtype)
         result = self._TYPE_MAP.get(key)
         assert result is not None, f"Unsupported dtype {dtype}"
         return result
+
+    def _kernel_call_args(self, declaration, function_params, desc_name_map, desc_name_var_map):
+        # LowerDeviceKernelLaunch preserves host call argument order. Device
+        # codegen names are local to the callee, not aliases of host variables.
+        args = []
+        for i, expr in enumerate(function_params):
+            if self.tma_descriptor_args is not None and expr in self.tma_descriptor_args:
+                parameter = declaration[declaration.index("(") + 1 : declaration.rindex(")")].split(",")[i]
+                name = re.search(r"(\w+)\s*$", parameter).group(1)
+                desc_name_map[name] = name
+                desc_name_var_map[name] = expr
+                args.append(name)
+            else:
+                args.append(self._pythonic_expr(expr))
+        return args
+
+    def _launch_expr(self, expr, function_name, function_params):
+        if isinstance(expr, tvm.tirx.PrimExpr):
+            bindings = dict(zip(self.device_mod[function_name].params, function_params))
+            expr = tvm.tirx.stmt_functor.substitute(expr, bindings)
+        return self._pythonic_expr(expr)
 
     def is_tma_descriptor_arg(self, arg_name: str) -> bool:
         return arg_name in self.prim_func.buffer_map
@@ -308,10 +366,9 @@ class TLCUDASourceWrapper:
                 function_args.append({"name": param.name, "type": self._lookup_type(param.dtype)})
             else:
                 raise ValueError(f"Parameter {param} is not in the buffer map of the primary function.")
-        # Add dynamic symbols as integer arguments
+        # Add implicit symbols in their canonical ABI order.
         for dyn_sym, dyn_sym_dtype in dynamic_symbolic_set:
-            if dyn_sym not in [arg["name"] for arg in function_args]:
-                function_args.append({"name": dyn_sym, "type": self._lookup_type(dyn_sym_dtype)})
+            function_args.append({"name": dyn_sym, "type": self._lookup_type(dyn_sym_dtype)})
 
         function_args.append(self.get_stream_type())
 
@@ -344,21 +401,14 @@ class TLCUDASourceWrapper:
             # Identify the start of the function body to insert arguments
             index = code.index("{", index)
 
-            block_str = (
-                f"dim3({self._pythonic_expr(block_info[0])}, {self._pythonic_expr(block_info[1])}, {self._pythonic_expr(block_info[2])})"
-            )
-            grid_str = (
-                f"dim3({self._pythonic_expr(grid_info[0])}, {self._pythonic_expr(grid_info[1])}, {self._pythonic_expr(grid_info[2])})"
-            )
+            block_str = "dim3(" + ", ".join(self._launch_expr(e, function_name, function_params) for e in block_info) + ")"
+            grid_str = "dim3(" + ", ".join(self._launch_expr(e, function_name, function_params) for e in grid_info) + ")"
             smem_str = 0 if dynamic_smem_buf is None else dynamic_smem_buf
             init_l2_persistent_map = self.generate_l2_persistent_map(function_name)
             kernel_launch_code += init_l2_persistent_map
 
             if self.use_cooperative_groups[function_name]:
-                args_list = parse_function_call_args(declaration, function_args, function_params, desc_name_map, desc_name_var_map)
-                assert len(function_params) == len(args_list), (
-                    f"Function {function_name} has {len(function_params)} parameters, but {len(args_list)} arguments"
-                )
+                args_list = self._kernel_call_args(declaration, function_params, desc_name_map, desc_name_var_map)
                 args_array = [f"(void*)&{arg}" for arg in args_list]
                 call_args = f"\tvoid* {function_name}_args[] = {{{', '.join(args_array)}}};\n"
                 kernel_launch_code += call_args
@@ -368,10 +418,7 @@ class TLCUDASourceWrapper:
                     function_name, grid_str, block_str, function_name + "_args", smem_str
                 )
             else:
-                args_list = parse_function_call_args(declaration, function_args, function_params, desc_name_map, desc_name_var_map)
-                assert len(function_params) == len(args_list), (
-                    f"Function {function_name} has {len(function_params)} parameters, but {len(args_list)} arguments"
-                )
+                args_list = self._kernel_call_args(declaration, function_params, desc_name_map, desc_name_var_map)
 
                 call_args = ", ".join(args_list)
                 kernel_code = self.get_kernel_launch_code(
@@ -538,31 +585,7 @@ class TLCUDASourceWrapper:
         self.function_names = function_names
 
     def get_dynamic_symbolic_set(self, prim_func):
-        # Determine the set of dynamic symbols used in the function
-        dynamic_symbolic_set: dict[str, str] = {}
-
-        def unique_push_back(name: str, dtype: str):
-            if name not in dynamic_symbolic_set:
-                dynamic_symbolic_set[name] = dtype
-            else:
-                assert dtype == dynamic_symbolic_set[name]
-
-        for param in prim_func.params:
-            if param in prim_func.buffer_map:
-                buffer = prim_func.buffer_map[param]
-                for dim in buffer.shape:
-                    if isinstance(dim, tvm.tirx.Var):
-                        unique_push_back(dim.name, str(dim.dtype))
-
-        # Note: In buffer definitions, any dynamic symbols appearing in strides are listed after those in the shape.
-        for param in prim_func.params:
-            if param in prim_func.buffer_map:
-                buffer = prim_func.buffer_map[param]
-                for stride in buffer.strides:
-                    if isinstance(stride, tvm.tirx.Var):
-                        unique_push_back(stride.name, str(stride.dtype))
-
-        return list(dynamic_symbolic_set.items())
+        return [(self.host_var_names[var], str(var.dtype)) for var in _get_dynamic_symbolic_vars(prim_func)]
 
     def get_kernel_launch_code(self, function_name, grid_str, block_str, smem_str, call_args, cluster_dims):
         if cluster_dims is None:
@@ -982,8 +1005,7 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
             else:
                 raise ValueError(f"Parameter {param} is not in the buffer map of the primary function.")
         for dyn_sym, dyn_sym_dtype in dynamic_symbolic_set:
-            if dyn_sym not in [arg["name"] for arg in function_args]:
-                function_args.append({"name": dyn_sym, "type": self._lookup_type(dyn_sym_dtype)})
+            function_args.append({"name": dyn_sym, "type": self._lookup_type(dyn_sym_dtype)})
 
         stream_type = self.get_stream_type()
         if stream_type is not None:
@@ -1005,14 +1027,11 @@ class TLAscendSourceWrapper(TLCUDASourceWrapper):
 
             smem_str = 0 if dynamic_smem_buf is None else dynamic_smem_buf
 
-            args_list = parse_function_call_args(declaration, function_args, function_params, {}, {})
-            assert len(function_params) == len(args_list), (
-                f"Function {function_name} has {len(function_params)} parameters, but {len(args_list)} arguments"
-            )
+            args_list = self._kernel_call_args(declaration, function_params, {}, {})
             call_args = ", ".join(args_list)
             # Ascend triple-chevron: <<<grid, smem, stream>>> (no block dim)
             # Ascend bisheng expects grid as a single unsigned int, not dim3
-            grid_dim = f"({self._pythonic_expr(grid_info[0])} * {self._pythonic_expr(grid_info[1])} * {self._pythonic_expr(grid_info[2])})"
+            grid_dim = "(" + " * ".join(self._launch_expr(e, function_name, function_params) for e in grid_info) + ")"
             stream_arg = "stream" if stream_type else "nullptr"
             kernel_launch_code += f"\t{function_name}<<<{grid_dim}, {smem_str}, {stream_arg}>>>({call_args});\n"
             kernel_launch_code += f'\tTILELANG_CHECK_LAST_ERROR("{function_name}");\n'

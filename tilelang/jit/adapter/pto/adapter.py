@@ -18,6 +18,7 @@ from tilelang.jit.adapter.base import BaseKernelAdapter, CachedTextSource
 from tilelang.utils.language import prim_expr_equal, retrieve_func_from_module
 
 from .libgen import PTOLibraryGenerator
+from tilelang.jit.adapter.wrapper import _get_dynamic_symbolic_vars
 from .wrapper import TLPTOWrapper
 
 
@@ -220,7 +221,8 @@ class PTOKernelAdapter(BaseKernelAdapter):
                 for j, stride in enumerate(buffer.strides):
                     if isinstance(stride, tirx.Var) and (stride not in dynamic_symbolic_map) and (stride not in params):
                         dynamic_symbolic_map[stride] = (1, i, j, stride_scale)
-        return dynamic_symbolic_map
+        # Carrier preference is input-first; ABI slots remain in primary-function order.
+        return {var: dynamic_symbolic_map[var] for var in _get_dynamic_symbolic_vars(func)}
 
     def _process_dynamic_symbolic_sources(self) -> dict[tirx.Var, list[tuple[int, int, int]]]:
         """Build a multi-source map for cascaded None resolution.
