@@ -188,7 +188,7 @@ def print(obj: Any = None, msg: str = "", warp_group_id: int = 0, warp_id: int =
             elems = 1
             for dim in buffer.shape:
                 elems *= dim
-            condition = True
+            condition = tx == main_lane and ty == 0 and tz == 0
             print_global_buffer_with_condition(condition, buffer, elems, msg)
         else:
             raise ValueError(f"Unsupported buffer scope: {buffer.scope()}")
